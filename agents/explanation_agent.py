@@ -4,8 +4,10 @@ import os
 from datetime import datetime
 from simulator.database import get_connection
 from .utils import extract_json
+from langsmith import traceable
+from langsmith.wrappers import wrap_anthropic
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = wrap_anthropic(anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"), timeout=60.0))
 
 EXPLANATION_SYSTEM_PROMPT = """
 You are the Explanation Agent for Pipeline Sentinel.
@@ -36,6 +38,8 @@ Respond ONLY with JSON:
 """
 
 
+@traceable(name="Explanation Agent", run_type="chain",
+           tags=["pipeline-sentinel", "explanation"])
 def run_explanation_agent(run_id: str,
                           incident_context: dict,
                           thought_callback=None) -> dict:
@@ -81,7 +85,9 @@ def write_incident_to_db(run_id: str, dag_id: str,
                          remediation_steps: list,
                          reflection_notes: str,
                          explanation: dict,
-                         thought_log: list = None) -> int:
+                         thought_log: list = None,
+                         blast_radius: str = None,
+                         patterns_consulted: list = None) -> int:
     """Write completed incident to the incidents table. Returns incident ID."""
     conn = get_connection()
     c = conn.cursor()
@@ -89,8 +95,9 @@ def write_incident_to_db(run_id: str, dag_id: str,
         INSERT INTO incidents
         (run_id, dag_id, failure_type, detected_at, resolved_at,
          resolution_status, retry_attempts, root_cause,
-         remediation_steps, reflection_notes, explanation, thought_log)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         remediation_steps, reflection_notes, explanation, thought_log,
+         blast_radius, patterns_consulted)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         run_id, dag_id, failure_type,
         datetime.now(), datetime.now(),
@@ -99,6 +106,8 @@ def write_incident_to_db(run_id: str, dag_id: str,
         reflection_notes,
         json.dumps(explanation),
         json.dumps(thought_log or []),
+        blast_radius,
+        json.dumps(patterns_consulted or []),
     ))
     incident_id = c.lastrowid
     conn.commit()

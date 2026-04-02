@@ -2,6 +2,7 @@ import json
 import random
 from datetime import datetime
 from .pipeline import PipelineSimulator, DAG_TASKS
+from .database import get_connection
 
 FAILURE_MODES = {
     "schema_drift": {
@@ -112,11 +113,44 @@ class FailureInjector:
             failure_detail=failure["error"]
         )
 
+        # For schema_drift: write a "current" snapshot showing the 3 missing columns
+        if failure_type == "schema_drift":
+            self._inject_schema_drift_snapshot()
+
         return {
             "failure_type": failure_type,
             "affected_task": affected_task,
             **failure,
         }
+
+    def _inject_schema_drift_snapshot(self) -> None:
+        """
+        Write an actual_columns snapshot to schema_registry for raw_orders
+        that is missing the 3 columns referenced in the schema_drift error message.
+        The check_schema_drift tool compares this against the expected baseline.
+        """
+        MISSING_COLS = {"promo_code", "region_id", "channel_tag"}
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute(
+            "SELECT expected_columns FROM schema_registry "
+            "WHERE table_name = 'raw_orders' AND actual_columns IS NULL "
+            "ORDER BY id LIMIT 1"
+        )
+        row = c.fetchone()
+        if row:
+            baseline = json.loads(row[0])
+            actual = [col for col in baseline if col not in MISSING_COLS]
+            # Upsert: remove any previous drift snapshot, insert fresh one
+            c.execute(
+                "DELETE FROM schema_registry WHERE table_name = 'raw_orders' AND actual_columns IS NOT NULL"
+            )
+            c.execute(
+                "INSERT INTO schema_registry (table_name, expected_columns, actual_columns) VALUES (?, ?, ?)",
+                ("raw_orders", json.dumps(baseline), json.dumps(actual)),
+            )
+            conn.commit()
+        conn.close()
 
     def simulate_healthy_run(self, run_id: str):
         """Run all tasks successfully."""

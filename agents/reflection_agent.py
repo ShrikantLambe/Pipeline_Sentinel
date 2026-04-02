@@ -3,8 +3,10 @@ import json
 import os
 from .tools import get_pipeline_status, check_row_count_anomaly
 from .utils import extract_json
+from langsmith import traceable
+from langsmith.wrappers import wrap_anthropic
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = wrap_anthropic(anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"), timeout=60.0))
 
 REFLECTION_SYSTEM_PROMPT = """
 You are the Reflection Agent for Pipeline Sentinel — the self-assessment layer
@@ -53,6 +55,8 @@ TOOL_FUNCTIONS = {
 }
 
 
+@traceable(name="Reflection Agent", run_type="chain",
+           tags=["pipeline-sentinel", "reflection"])
 def run_reflection_agent(run_id: str,
                          remediation_result: dict,
                          retry_count: int,

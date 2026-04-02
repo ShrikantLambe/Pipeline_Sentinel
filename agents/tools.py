@@ -350,6 +350,109 @@ def check_task_duration_anomaly(run_id: str) -> dict:
     }
 
 
+def check_schema_drift(run_id: str) -> dict:
+    """
+    Prompt 2 — Schema Drift Detection.
+    Compares the latest actual-schema snapshot against the baseline in schema_registry.
+
+    Detects four drift types:
+      - column_removed  → BREAKING
+      - type_changed    → BREAKING  (not yet wired; placeholder for real Snowflake metadata)
+      - column_added    → WARNING
+      - column_renamed  → INFO (fuzzy match via difflib)
+
+    Returns drift_events list and a human-readable drift_summary for the Explanation agent.
+    """
+    import difflib
+
+    conn = get_connection()
+    c = conn.cursor()
+
+    # Fetch the latest baseline (actual_columns IS NULL) and latest snapshot
+    # (actual_columns IS NOT NULL) for each table.
+    c.execute("""
+        SELECT table_name, expected_columns, actual_columns
+        FROM schema_registry
+        ORDER BY recorded_at DESC
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    # Group: keep first occurrence per table for each category
+    baselines: dict[str, list] = {}
+    snapshots: dict[str, list] = {}
+    for table_name, exp_json, act_json in rows:
+        if act_json is None and table_name not in baselines:
+            baselines[table_name] = json.loads(exp_json)
+        elif act_json is not None and table_name not in snapshots:
+            snapshots[table_name] = json.loads(act_json)
+
+    drift_events = []
+    tables_with_snapshots = set(baselines) & set(snapshots)
+
+    for table in tables_with_snapshots:
+        expected = baselines[table]
+        actual = snapshots[table]
+        expected_set = set(expected)
+        actual_set = set(actual)
+
+        removed = expected_set - actual_set
+        added = actual_set - expected_set
+
+        # Fuzzy rename: removed col with >=75% similarity to an added col
+        rename_map: dict[str, str] = {}
+        for rem in list(removed):
+            matches = difflib.get_close_matches(rem, list(added), n=1, cutoff=0.75)
+            if matches:
+                rename_map[rem] = matches[0]
+
+        renamed_from = set(rename_map.keys())
+        renamed_to = set(rename_map.values())
+
+        for col in removed - renamed_from:
+            drift_events.append({
+                "table": table, "drift_type": "column_removed",
+                "column": col, "severity": "BREAKING",
+            })
+        for col in added - renamed_to:
+            drift_events.append({
+                "table": table, "drift_type": "column_added",
+                "column": col, "severity": "WARNING",
+            })
+        for old_col, new_col in rename_map.items():
+            drift_events.append({
+                "table": table, "drift_type": "column_renamed",
+                "from": old_col, "to": new_col, "severity": "INFO",
+            })
+
+    breaking = [e for e in drift_events if e["severity"] == "BREAKING"]
+    warnings  = [e for e in drift_events if e["severity"] == "WARNING"]
+    info      = [e for e in drift_events if e["severity"] == "INFO"]
+
+    # Human-readable summary for the Explanation agent
+    summary_parts = []
+    if breaking:
+        cols = ", ".join(f"`{e['column']}`" for e in breaking[:5])
+        summary_parts.append(f"BREAKING: {len(breaking)} column(s) removed ({cols})")
+    if warnings:
+        cols = ", ".join(f"`{e['column']}`" for e in warnings[:5])
+        summary_parts.append(f"WARNING: {len(warnings)} new column(s) added ({cols})")
+    if info:
+        renames = ", ".join(f"`{e['from']}` → `{e['to']}`" for e in info[:3])
+        summary_parts.append(f"INFO: {len(info)} rename candidate(s) ({renames})")
+
+    drift_summary = "; ".join(summary_parts) if summary_parts else "No schema drift detected."
+
+    return {
+        "run_id": run_id,
+        "tables_checked": len(tables_with_snapshots),
+        "has_drift": len(drift_events) > 0,
+        "drift_events": drift_events,
+        "breaking_changes": breaking,
+        "drift_summary": drift_summary,
+    }
+
+
 def check_zombie_run(run_id: str, stale_minutes: int = 30) -> dict:
     """
     Detect tasks stuck in 'running' state past their expected duration.

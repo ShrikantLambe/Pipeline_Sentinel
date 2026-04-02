@@ -1,10 +1,15 @@
 import anthropic
 import json
 import os
-from .tools import get_pipeline_status, check_row_count_anomaly, get_failed_tasks, check_task_duration_anomaly, check_zombie_run
+from .tools import (
+    get_pipeline_status, check_row_count_anomaly, get_failed_tasks,
+    check_task_duration_anomaly, check_zombie_run, check_schema_drift,
+)
 from .utils import extract_json
+from langsmith import traceable
+from langsmith.wrappers import wrap_anthropic
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = wrap_anthropic(anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"), timeout=60.0))
 
 MONITOR_TOOLS = [
     {
@@ -64,6 +69,21 @@ MONITOR_TOOLS = [
             "required": ["run_id"]
         }
     },
+    {
+        "name": "check_schema_drift",
+        "description": (
+            "Compare the current schema snapshot against the registered baseline for pipeline tables. "
+            "Detects: column_removed (BREAKING), column_added (WARNING), column_renamed (INFO). "
+            "Call this when a validate_raw_schema task fails or when schema_drift is suspected."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"}
+            },
+            "required": ["run_id"]
+        }
+    },
 ]
 
 TOOL_FUNCTIONS = {
@@ -72,6 +92,7 @@ TOOL_FUNCTIONS = {
     "get_failed_tasks": get_failed_tasks,
     "check_task_duration_anomaly": check_task_duration_anomaly,
     "check_zombie_run": check_zombie_run,
+    "check_schema_drift": check_schema_drift,
 }
 
 MONITOR_SYSTEM_PROMPT = """
@@ -86,7 +107,7 @@ Anomaly types to detect:
 - failed_task: One or more tasks explicitly failed with an error
 - row_count_anomaly: Actual rows deviate >15% from expected (flag even if expected=0 and actual>0)
 - duration_anomaly: A task ran >3x its normal baseline duration (SLA breach even if succeeded)
-- schema_drift: Column mismatch detected in validate_raw_schema task
+- schema_drift: Column mismatch detected in validate_raw_schema task — use check_schema_drift tool for details
 - zombie_task: A task stuck in 'running' state >30 minutes
 - auth_failure: PermissionDenied / credential error — always mark severity=critical
 
@@ -104,6 +125,8 @@ Be concise. Use tools to gather evidence before making your assessment.
 """
 
 
+@traceable(name="Monitor Agent", run_type="chain",
+           tags=["pipeline-sentinel", "monitor"])
 def run_monitor_agent(run_id: str,
                       thought_callback=None,
                       stop_event=None) -> dict:

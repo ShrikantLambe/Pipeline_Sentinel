@@ -5,8 +5,10 @@ from .tools import (retry_task, apply_dedup, reload_schema,
                     extend_ingestion_window, run_dbt_full_refresh,
                     get_pipeline_status)
 from .utils import extract_json
+from langsmith import traceable
+from langsmith.wrappers import wrap_anthropic
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = wrap_anthropic(anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"), timeout=60.0))
 
 REMEDIATION_TOOLS = [
     {"name": "retry_task",
@@ -73,6 +75,8 @@ Respond ONLY with JSON:
 """
 
 
+@traceable(name="Remediation Agent", run_type="chain",
+           tags=["pipeline-sentinel", "remediation"])
 def run_remediation_agent(run_id: str, diagnosis: dict,
                           thought_callback=None,
                           stop_event=None) -> dict:

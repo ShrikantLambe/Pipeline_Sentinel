@@ -10,7 +10,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env  # then add ANTHROPIC_API_KEY
 
-# Initialize database
+# Initialize database (creates all tables + seeds schema_registry baselines)
 python -c "from simulator.database import init_db; init_db()"
 
 # Run all tests (no LLM calls — agents and orchestration are mocked)
@@ -36,6 +36,19 @@ for ft in FAILURE_MODES:
     orch = SentinelOrchestrator(thought_callback=lambda t: print(f'  [{t[\"agent\"]}] {t[\"content\"][:80]}'))
     r = orch.run(run_id); print(f'{ft}: {r.get(\"resolution_status\", r.get(\"status\"))}')
 "
+
+# Query audit trail for a completed incident
+python -c "
+from agents.audit import get_incident_audit
+for step in get_incident_audit(1):
+    print(f'[{step[\"agent_name\"]}] {step[\"decision\"]}')
+"
+
+# Check self-healing metrics
+python -c "
+from agents.metrics import compute_self_healing_metrics
+import json; print(json.dumps(compute_self_healing_metrics(), indent=2))
+"
 ```
 
 ## Environment variables
@@ -49,6 +62,9 @@ for ft in FAILURE_MODES:
 | `USE_AIRFLOW` | `false` | Set `true` to use real Airflow |
 | `AIRFLOW_URL` | `http://localhost:8080` | Airflow base URL |
 | `AIRFLOW_USERNAME` / `AIRFLOW_PASSWORD` | `airflow` | Airflow credentials |
+| `LANGCHAIN_TRACING_V2` | `false` | Set `true` to enable LangSmith tracing |
+| `LANGCHAIN_API_KEY` | — | LangSmith API key (from smith.langchain.com) |
+| `LANGCHAIN_PROJECT` | `pipeline-sentinel` | LangSmith project name |
 
 Tests override `PIPELINE_DB_PATH` with a temp path — each test run is fully isolated.
 
@@ -58,12 +74,17 @@ Tests override `PIPELINE_DB_PATH` with a temp path — each test run is fully is
 
 `SentinelOrchestrator.run()` in [orchestrator/sentinel.py](orchestrator/sentinel.py) coordinates five agents:
 
-1. **Monitor** → calls 5 detection tools, returns `anomaly_detected` + `anomaly_type`
-2. **Diagnosis** → maps anomaly to `root_cause` + `remediation_strategy`
-3. **Remediation** → executes fix tool, verifies via `get_pipeline_status`
-4. **Reflection** → returns `assessment`: `resolved | retry | escalate`; loops back to Remediation up to `MAX_RETRY_ATTEMPTS`, tracking `tried_strategies` to prevent repeating failed approaches
-5. **Explanation** → single LLM call (no tools), returns plain-English incident summary
-6. `write_incident_to_db()` stores the full incident + thought log for replay
+1. **Monitor** → calls 6 detection tools (including `check_schema_drift`), returns `anomaly_detected` + `anomaly_type`
+2. **Blast radius** → `assess_blast_radius(affected_task)` scores impact: LOW / MEDIUM / HIGH
+3. **Diagnosis** → checks pattern memory first (`get_known_patterns`); if no high-confidence match, runs full LLM ReAct loop to return `root_cause` + `remediation_strategy`
+4. **Escalation gate** → `should_auto_remediate(confidence, blast_radius)`: auto-remediate only if `confidence == "high"` AND `blast_radius == "LOW"`; otherwise escalate immediately
+5. **Remediation** → executes fix tool, verifies via `get_pipeline_status`
+6. **Reflection** → returns `assessment`: `resolved | retry | escalate`; loops back to Remediation up to `MAX_RETRY_ATTEMPTS`, tracking `tried_strategies` to prevent repeating failed approaches
+7. **Explanation** → single LLM call (no tools), returns plain-English incident summary
+8. **Write** → `write_incident_to_db()` stores the full incident + thought log + blast_radius + patterns_consulted
+9. **Audit** → `update_audit_incident_id()` back-fills incident_id on all audit log rows for the run
+10. **Outcome** → `write_incident_outcome()` writes one row to `incident_outcomes` for metrics
+11. **Pattern upsert** → `upsert_pattern()` updates rolling success_rate + occurrence_count
 
 The orchestrator passes a `stop_event: threading.Event` through to each agent so the UI cancel button terminates the run within one LLM call cycle (≤60s).
 
@@ -71,34 +92,80 @@ The orchestrator passes a `stop_event: threading.Event` through to each agent so
 
 Every agent in `agents/` follows the same structure:
 - Signature: `run_<name>_agent(run_id, ..., thought_callback=None, stop_event=None) -> dict`
+- Decorated with `@traceable(name=..., run_type="chain")` for LangSmith tracing
+- Anthropic client wrapped with `wrap_anthropic()` so individual LLM calls appear as nested spans
 - `while True` loop with guard: `max 10 iterations`, `stop_event.is_set()` check, `timeout=60` on every `client.messages.create()` call
 - Tool-use: `stop_reason == "tool_use"` → execute tools → append `tool_result` messages → loop
 - `stop_reason == "end_turn"` → extract JSON with `agents/utils.py:extract_json()` → return
 - `thought_callback({"agent", "type", "content"})` is called for every thought, tool call, and observation — streams to the UI in real time
 
+### New feature modules (Prompts 1–6)
+
+| Module | Purpose |
+|---|---|
+| [agents/audit.py](agents/audit.py) | `log_agent_transition()`, `get_incident_audit(incident_id)`, `update_audit_incident_id()` |
+| [agents/blast_radius.py](agents/blast_radius.py) | `DEPENDENCY_GRAPH`, `assess_blast_radius(task)`, `should_auto_remediate(confidence, blast)` |
+| [agents/metrics.py](agents/metrics.py) | `write_incident_outcome()`, `compute_self_healing_metrics(days=30)` |
+| [agents/patterns.py](agents/patterns.py) | `get_known_patterns(pipeline)`, `match_pattern()`, `upsert_pattern()` |
+
 ### Tools
 
-All tool functions live in [agents/tools.py](agents/tools.py). They read/write SQLite directly. Tool schemas (for the Anthropic API) and the Python dispatch dict (`TOOL_FUNCTIONS`) are both defined in each agent file.
+All tool functions live in [agents/tools.py](agents/tools.py). They read/write SQLite directly. The Monitor agent now includes a 6th tool `check_schema_drift` that compares the latest schema snapshot in `schema_registry` against the expected baseline (seeded by `init_db()`). When `schema_drift` failure type is injected, `failure_injector.py` writes a drift snapshot showing 3 missing columns.
 
 In simulator mode, remediation tools have probabilistic success rates (70–85%) to exercise the retry logic. In Airflow mode (`USE_AIRFLOW=true`), `retry_task` and `run_dbt_full_refresh` call the Airflow REST API; other tools fall back to simulator logic.
 
 ### Data layer
 
-SQLite via [simulator/database.py](simulator/database.py). Three tables:
+SQLite via [simulator/database.py](simulator/database.py). Seven tables:
 - `pipeline_runs` — one row per DAG run (status, row counts, failure type, timestamps)
 - `task_states` — one row per task per run (status, duration, error message)
-- `incidents` — audit log per anomaly (root cause, remediation steps, thought log JSON)
+- `schema_registry` — baseline schema snapshots (expected_columns) and current snapshots (actual_columns) per table; seeded by `init_db()`
+- `incidents` — one row per anomaly (root cause, remediation steps, thought log, blast_radius, patterns_consulted)
+- `agent_audit_log` — one row per agent transition per incident (input/output summaries, decision, confidence)
+- `incident_outcomes` — structured metrics per incident (resolution_type, MTTR, blast_radius, confidence_score)
+- `incident_patterns` — rolling pattern memory per (root_cause, pipeline, fix_action): success_rate, occurrence_count
 
 `data/` is gitignored. The directory is created by `get_connection()` on first access.
 
+### Blast radius + escalation gate
+
+`DEPENDENCY_GRAPH` in [agents/blast_radius.py](agents/blast_radius.py) maps each pipeline task to its output assets, affected level (raw/staging/mart/consumer), and downstream consumers. `assess_blast_radius()` does a BFS to find all reachable consumers and scores the impact.
+
+Gate rule: auto-remediate **only** when `confidence == "high" AND blast_radius == "LOW"`. Failures in mart-level tasks (`run_dbt_mart_models`, `update_snowflake_aggregates`) always escalate because they reach executive dashboards and ML models.
+
+### Pattern memory
+
+After each incident, `upsert_pattern()` updates the rolling `success_rate` and `occurrence_count` for the `(root_cause_category, pipeline_name, fix_action_taken)` triple. On the next identical failure, the Diagnosis agent calls `get_known_patterns()` **before** its LLM loop. If a pattern has `occurrence_count >= 3` and `success_rate >= 0.90`, the agent skips LLM reasoning entirely and returns the cached strategy — flagged as `pattern_matched: True` in state and shown as ⚡ in the UI.
+
+### LangSmith tracing
+
+When `LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_API_KEY` are set, every `@traceable`-decorated function emits a span to LangSmith. Individual Anthropic `messages.create()` calls appear as nested LLM spans because each agent wraps its client with `wrap_anthropic()`. Trace the orchestrator run with the `run_id` as the LangSmith run name for easy lookup.
+
+To verify tracing:
+```bash
+LANGCHAIN_TRACING_V2=true LANGCHAIN_API_KEY=ls__... python -c "
+from simulator.database import init_db
+from simulator.pipeline import PipelineSimulator
+from simulator.failure_injector import FailureInjector
+init_db()
+sim = PipelineSimulator(); inj = FailureInjector(sim)
+run_id = sim.start_run(); inj.inject(run_id, failure_type='upstream_timeout')
+from orchestrator.sentinel import SentinelOrchestrator
+SentinelOrchestrator().run(run_id)
+print('Check https://smith.langchain.com for the trace')
+"
+```
+
 ### Failure modes
 
-[simulator/failure_injector.py](simulator/failure_injector.py) defines 7 failure modes in `FAILURE_MODES`. `inject()` runs all tasks up to the failure point as success, fails the affected task, and marks all downstream tasks as `upstream_failed`.
-
-### Airflow integration
-
-[simulator/airflow_connector.py](simulator/airflow_connector.py) wraps the Airflow REST API v1. `sync_run_to_db()` pulls a DAG run + task instances into our SQLite schema. `poll_failed_runs()` finds failed runs not yet in the local DB. Failure type detection uses log keyword heuristics.
+[simulator/failure_injector.py](simulator/failure_injector.py) defines 7 failure modes in `FAILURE_MODES`. `inject()` runs all tasks up to the failure point as success, fails the affected task, and marks all downstream tasks as `upstream_failed`. For `schema_drift`, it also writes an `actual_columns` snapshot to `schema_registry` (missing 3 columns) so `check_schema_drift` returns a real drift result.
 
 ### Streamlit UI
 
-[app/streamlit_app.py](app/streamlit_app.py) runs the agent pipeline in a background `threading.Thread` and re-renders every 0.5s via `st.rerun()` while the thread is active. Key session state: `thought_stream` (live feed), `agent_phase` (current agent), `phases_done` (completed agents), `verdict` (loaded from DB after run completes), `running` (thread alive flag).
+[app/streamlit_app.py](app/streamlit_app.py) runs the agent pipeline in a background `threading.Thread` and re-renders every 0.5s via `st.rerun()` while the thread is active.
+
+Key session state: `thought_stream` (live feed), `agent_phase` (current agent), `phases_done` (completed agents), `verdict` (loaded from DB after run completes, includes `blast_radius` and `pattern_matched`), `running` (thread alive flag).
+
+The dashboard top shows a 5-column KPI row (via `compute_self_healing_metrics()`) with total incidents, auto-resolved count + %, escalated count, and MTTR for both resolution types, plus an expandable daily trend chart.
+
+The verdict section shows blast radius badge (color-coded LOW/MEDIUM/HIGH) and ⚡ Pattern-matched badge when pattern memory was used.

@@ -13,6 +13,8 @@ from simulator.pipeline import PipelineSimulator
 from simulator.failure_injector import FailureInjector, FAILURE_MODES
 from simulator.airflow_connector import AirflowConnector
 from orchestrator.sentinel import SentinelOrchestrator
+from agents.metrics import compute_self_healing_metrics
+from agents.audit import get_incident_audit
 
 _STOP_EVENT = threading.Event()
 
@@ -404,6 +406,44 @@ with st.sidebar:
 # ── Main content ──────────────────────────────────────────────────────────
 st.title("🛡️ Pipeline Sentinel")
 
+# ── Self-healing metrics summary (Prompt 3) ───────────────────────────────
+def _render_metrics_row():
+    """Compact KPI row at the top of the dashboard."""
+    m = compute_self_healing_metrics(days=30)
+    total = m["total_incidents"]
+    if total == 0:
+        st.caption("No incidents in the last 30 days — run a simulation to see metrics.")
+        return
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Incidents (30d)", total)
+    c2.metric("Auto-resolved", m["auto_resolved"],
+              delta=f"{m['self_healing_rate_pct']}%")
+    c3.metric("Escalated", m["escalated"])
+
+    def _fmt_mttr(secs):
+        if secs is None:
+            return "—"
+        if secs < 60:
+            return f"{secs:.0f}s"
+        return f"{secs/60:.1f}m"
+
+    c4.metric("MTTR (auto)", _fmt_mttr(m["avg_mttr_auto_seconds"]))
+    c5.metric("MTTR (escalated)", _fmt_mttr(m["avg_mttr_escalated_seconds"]))
+
+    if m["daily_trend"] and len(m["daily_trend"]) > 1:
+        import streamlit as _st
+        dates = [d["date"] for d in m["daily_trend"]]
+        rates = [d["rate_pct"] for d in m["daily_trend"]]
+        with st.expander("📈 Daily self-healing rate trend", expanded=False):
+            st.line_chart(
+                {"Self-healing rate (%)": dict(zip(dates, rates))},
+                height=140,
+            )
+
+_render_metrics_row()
+st.divider()
+
 if st.session_state.run_error:
     err = st.session_state.run_error
     if err == "Cancelled by user." or "Cancelled" in err:
@@ -495,16 +535,17 @@ def render_tasks(run_state: dict):
             dur_str = f'<span class="task-dur">{dur:.1f}s</span>' if dur else '<span class="task-dur">—</span>'
             label_css = f"tsl-{css}"
             label_txt = "upstream" if css == "upstream" else s
+            safe_name = name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("{", "&#123;").replace("}", "&#125;")
 
             err_html = ""
             if err and s == "failed":
-                short = str(err)[:120].replace("<", "&lt;").replace(">", "&gt;")
+                short = str(err)[:120].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("{", "&#123;").replace("}", "&#125;")
                 err_html = f'<div class="task-err">⚠ {short}</div>'
 
             rows_html += f"""
             <div class="task-item ti-{css}">
               <span class="task-status-label {label_css}">{label_txt}</span>
-              <span class="task-name">{name}</span>
+              <span class="task-name">{safe_name}</span>
               {dur_str}
               {err_html}
             </div>"""
@@ -673,6 +714,22 @@ def render_verdict():
             if ttr:
                 st.caption(f"Time to resolution: {ttr}")
 
+            # Blast radius & pattern memory badges (Prompts 4 & 5)
+            blast  = verdict.get("blast_radius")
+            pmatch = verdict.get("pattern_matched", False)
+            badges = []
+            if blast:
+                color = {"LOW": "#2ecc71", "MEDIUM": "#e67e22", "HIGH": "#e74c3c"}.get(blast, "#aaa")
+                badges.append(f'<span style="background:rgba(150,150,150,0.1);border:1px solid {color};'
+                               f'color:{color};padding:2px 8px;border-radius:10px;font-size:11px;'
+                               f'font-weight:700">Blast: {blast}</span>')
+            if pmatch:
+                badges.append('<span style="background:rgba(74,144,217,0.1);border:1px solid #4a90d9;'
+                               'color:#4a90d9;padding:2px 8px;border-radius:10px;font-size:11px;'
+                               'font-weight:700">⚡ Pattern-matched</span>')
+            if badges:
+                st.markdown(" &nbsp; ".join(badges), unsafe_allow_html=True)
+
 
 # ── Incident History ──────────────────────────────────────────────────────
 st.divider()
@@ -685,7 +742,8 @@ def _load_verdict_from_db(run_id: str):
     conn = get_connection()
     c = conn.cursor()
     c.execute("""
-        SELECT resolution_status, root_cause, remediation_steps, explanation, retry_attempts
+        SELECT resolution_status, root_cause, remediation_steps, explanation,
+               retry_attempts, blast_radius, patterns_consulted
         FROM incidents WHERE run_id = ?
         ORDER BY created_at DESC LIMIT 1
     """, (run_id,))
@@ -693,13 +751,22 @@ def _load_verdict_from_db(run_id: str):
     conn.close()
     if not row:
         return
-    status, root, steps_json, expl_json, retries = row
+    status, root, steps_json, expl_json, retries, blast, patterns_json = row
     try:
-        expl  = json.loads(expl_json) if expl_json else {}
-        steps = json.loads(steps_json) if steps_json else []
+        expl     = json.loads(expl_json)    if expl_json    else {}
+        steps    = json.loads(steps_json)   if steps_json   else []
+        patterns = json.loads(patterns_json) if patterns_json else []
     except Exception:
-        expl  = {}
-        steps = []
+        expl     = {}
+        steps    = []
+        patterns = []
+
+    # Infer pattern_matched: any pattern was consulted AND diagnosis was fast-pathed.
+    # We detect this from whether the first pattern had occurrence_count >= 3.
+    pattern_matched = any(
+        p.get("count", 0) >= 3 and p.get("rate", 0) >= 0.9
+        for p in patterns
+    ) if patterns else False
 
     st.session_state.verdict = {
         "resolution_status":  status,
@@ -708,6 +775,8 @@ def _load_verdict_from_db(run_id: str):
         "summary":            expl.get("summary", ""),
         "action_required":    expl.get("action_required", ""),
         "ttr":                expl.get("time_to_resolution", ""),
+        "blast_radius":       blast,
+        "pattern_matched":    pattern_matched,
     }
 
 
