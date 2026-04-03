@@ -48,7 +48,18 @@ def check_pipeline_freshness(dag_ids: list[str]) -> list[str]:
             (dag_id,),
         )
         row         = c.fetchone()
-        last_success = row[0] if row and row[0] else None
+        last_success_raw = row[0] if row and row[0] else None
+
+        # Parse string → datetime (MAX() aggregate bypasses SQLite type converters)
+        last_success = None
+        if last_success_raw:
+            try:
+                last_success = (
+                    last_success_raw if isinstance(last_success_raw, datetime)
+                    else datetime.fromisoformat(str(last_success_raw))
+                )
+            except Exception:
+                last_success = None
 
         # Already fresh — skip
         if last_success and last_success >= cutoff:
