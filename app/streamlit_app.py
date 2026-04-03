@@ -148,6 +148,36 @@ st.markdown("""
     border: 1px solid currentColor;
   }
   a.af-link:hover { opacity: 1; }
+
+  /* ── Watcher activity ── */
+  .watcher-card {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 14px; border-radius: 8px; margin-bottom: 6px;
+    border: 1px solid rgba(150,150,150,0.2);
+    background: rgba(150,150,150,0.04);
+  }
+  .watcher-card.active {
+    border-color: rgba(241,196,15,0.4);
+    background: rgba(241,196,15,0.06);
+  }
+  .watcher-card.resolved {
+    border-color: rgba(46,204,113,0.35);
+    background: rgba(46,204,113,0.05);
+  }
+  .watcher-card.escalated {
+    border-color: rgba(155,89,182,0.35);
+    background: rgba(155,89,182,0.05);
+  }
+  .watcher-pill {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; padding: 2px 8px;
+    border-radius: 10px; white-space: nowrap;
+  }
+  .watcher-pill.active   { color: #f1c40f; background: rgba(241,196,15,0.15); }
+  .watcher-pill.resolved { color: #2ecc71; background: rgba(46,204,113,0.15); }
+  .watcher-pill.escalated{ color: #9b59b6; background: rgba(155,89,182,0.15); }
+  .watcher-meta { font-size: 12px; opacity: 0.6; }
+  .watcher-title { font-size: 13px; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -170,10 +200,15 @@ _DEFAULTS = {
     "af_selected_run":  None,
     "af_ping_ok":       None,
     "af_ping_error":    "",
+    "watcher_active":   False,  # True when watcher runs are in progress
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# Set once per browser session — used to detect watcher activity that appeared after page load
+if "page_loaded_at" not in st.session_state:
+    st.session_state.page_loaded_at = datetime.now()
 
 MAX_STREAM_DISPLAY = 60
 MAX_STREAM_STORED  = 500
@@ -731,6 +766,165 @@ def render_verdict():
                 st.markdown(" &nbsp; ".join(badges), unsafe_allow_html=True)
 
 
+# ── Autonomous Watcher Activity ───────────────────────────────────────────
+st.divider()
+st.subheader("🤖 Autonomous Watcher")
+watcher_placeholder = st.empty()
+
+
+def _get_watcher_activity() -> tuple[list, list]:
+    """
+    Returns (active_runs, completed_incidents).
+
+    active_runs      — pipeline_runs rows that are failed with no incident yet,
+                       created within the last 30 minutes (watcher is processing them).
+    completed_incidents — incidents created since page_loaded_at that were NOT
+                          triggered by the current button-triggered run.
+    """
+    page_loaded_at = st.session_state.page_loaded_at
+    current_run_id = st.session_state.current_run_id
+    cutoff_active  = datetime.now().replace(microsecond=0) - __import__("datetime").timedelta(minutes=30)
+
+    conn = get_connection()
+    c    = conn.cursor()
+
+    # Runs in progress: failed + no incident + created recently
+    c.execute(
+        """
+        SELECT run_id, dag_id, failure_type, failure_detail, created_at
+        FROM pipeline_runs
+        WHERE status = 'failed'
+          AND created_at >= ?
+          AND run_id NOT IN (SELECT run_id FROM incidents)
+        ORDER BY created_at DESC
+        """,
+        (cutoff_active.isoformat(),),
+    )
+    active = [dict(zip([d[0] for d in c.description], r)) for r in c.fetchall()]
+
+    # Completed since page load, excluding the button-triggered run
+    c.execute(
+        """
+        SELECT id, run_id, dag_id, failure_type, resolution_status,
+               retry_attempts, explanation, thought_log, blast_radius, created_at
+        FROM incidents
+        WHERE created_at >= ?
+          AND (? IS NULL OR run_id != ?)
+        ORDER BY created_at DESC
+        LIMIT 20
+        """,
+        (page_loaded_at.isoformat(), current_run_id, current_run_id),
+    )
+    completed = [dict(zip([d[0] for d in c.description], r)) for r in c.fetchall()]
+
+    conn.close()
+    return active, completed
+
+
+def render_watcher_activity():
+    active, completed = _get_watcher_activity()
+
+    # Keep polling while watcher runs are in progress
+    st.session_state.watcher_active = len(active) > 0
+
+    with watcher_placeholder.container():
+        if not active and not completed:
+            st.caption("No autonomous watcher activity this session. Start the watcher with `python -m watcher.sentinel_watcher`.")
+            return
+
+        # ── Active runs ────────────────────────────────────────────────────
+        if active:
+            for run in active:
+                rid   = run.get("run_id", "")
+                dag   = run.get("dag_id", "")
+                ftype = (run.get("failure_type") or "unknown").replace("_", " ").title()
+                ts    = run.get("created_at")
+                try:
+                    elapsed = int((datetime.now() - datetime.fromisoformat(str(ts))).total_seconds())
+                    elapsed_str = f"{elapsed}s ago"
+                except Exception:
+                    elapsed_str = ""
+
+                st.markdown(
+                    f'<div class="watcher-card active">'
+                    f'<span class="watcher-pill active">⟳ Processing</span>'
+                    f'<div>'
+                    f'<div class="watcher-title">{ftype} — <code>{dag}</code></div>'
+                    f'<div class="watcher-meta">run_id: <code>{rid[:40]}</code>  ·  started {elapsed_str}</div>'
+                    f'</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+        # ── Completed incidents ────────────────────────────────────────────
+        for inc in completed:
+            inc_id  = inc.get("id")
+            rid     = inc.get("run_id", "")
+            dag     = inc.get("dag_id", "")
+            ftype   = (inc.get("failure_type") or "unknown").replace("_", " ").title()
+            status  = inc.get("resolution_status", "unknown")
+            retries = inc.get("retry_attempts", 0)
+            blast   = inc.get("blast_radius")
+            ts      = inc.get("created_at")
+
+            try:
+                expl    = json.loads(inc.get("explanation") or "{}")
+                title   = expl.get("title") or ftype
+                summary = expl.get("summary", "")
+                action  = expl.get("action_required")
+                ttr     = expl.get("time_to_resolution", "")
+            except Exception:
+                title   = ftype
+                summary = ""
+                action  = None
+                ttr     = ""
+
+            try:
+                thoughts = json.loads(inc.get("thought_log") or "[]")
+            except Exception:
+                thoughts = []
+
+            pill_cls = "resolved" if status == "resolved" else "escalated"
+            icon     = "✅" if status == "resolved" else "🟣"
+            blast_html = ""
+            if blast:
+                bc = {"LOW": "#2ecc71", "MEDIUM": "#e67e22", "HIGH": "#e74c3c"}.get(blast, "#aaa")
+                blast_html = (
+                    f' &nbsp;<span style="font-size:10px;font-weight:700;color:{bc};'
+                    f'border:1px solid {bc};padding:1px 6px;border-radius:8px">{blast}</span>'
+                )
+
+            st.markdown(
+                f'<div class="watcher-card {pill_cls}">'
+                f'<span class="watcher-pill {pill_cls}">{icon} {status.upper()}</span>'
+                f'<div style="flex:1">'
+                f'<div class="watcher-title">{title}{blast_html}</div>'
+                f'<div class="watcher-meta">'
+                f'DAG: <code>{dag}</code>  ·  '
+                f'{retries} retr{"y" if retries == 1 else "ies"}  ·  '
+                f'{ttr or "—"}  ·  '
+                f'<code style="font-size:10px">{str(ts)[:16]}</code>'
+                f'</div>'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            if summary or action or thoughts:
+                with st.expander(f"Details — incident #{inc_id}", expanded=False):
+                    if summary:
+                        st.markdown(summary)
+                    if action:
+                        st.warning(f"**Action required:** {action}", icon="⚠️")
+                    if thoughts:
+                        st.markdown(f"**Agent reasoning** ({len(thoughts)} steps)")
+                        with st.container(height=280, border=False):
+                            st.markdown(
+                                "".join(thought_html(t) for t in thoughts),
+                                unsafe_allow_html=True,
+                            )
+
+
 # ── Incident History ──────────────────────────────────────────────────────
 st.divider()
 st.subheader("📋 Incident History")
@@ -889,9 +1083,10 @@ render_run_header(run_state)
 render_tasks(run_state)
 render_analysis()
 render_verdict()
+render_watcher_activity()
 render_history()
 
-# Live-update poll while agent thread is active
-if st.session_state.running:
+# Live-update poll while button-triggered thread is active OR watcher is processing
+if st.session_state.running or st.session_state.get("watcher_active", False):
     time.sleep(0.5)
     st.rerun()
