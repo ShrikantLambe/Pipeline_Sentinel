@@ -49,6 +49,17 @@ python -c "
 from agents.metrics import compute_self_healing_metrics
 import json; print(json.dumps(compute_self_healing_metrics(), indent=2))
 "
+
+# Start the autonomous watcher (polls Airflow + runs proactive checks)
+python -m watcher.sentinel_watcher
+
+# Start the webhook server (receives Airflow on_failure_callback POSTs)
+uvicorn watcher.webhook_server:app --host 0.0.0.0 --port 8765
+
+# Test the webhook manually (simulates an Airflow failure event)
+curl -X POST http://localhost:8765/webhook/failure \
+     -H "Content-Type: application/json" \
+     -d '{"dag_id": "retail_pipeline", "run_id": "your_run_id"}'
 ```
 
 ## Environment variables
@@ -65,6 +76,13 @@ import json; print(json.dumps(compute_self_healing_metrics(), indent=2))
 | `LANGCHAIN_TRACING_V2` | `false` | Set `true` to enable LangSmith tracing |
 | `LANGCHAIN_API_KEY` | — | LangSmith API key (from smith.langchain.com) |
 | `LANGCHAIN_PROJECT` | `pipeline-sentinel` | LangSmith project name |
+| `WATCHER_DAG_IDS` | — | Comma-separated DAG IDs for the autonomous watcher |
+| `WATCHER_POLL_INTERVAL_SECONDS` | `300` | How often to poll Airflow for new failures |
+| `WATCHER_PROACTIVE_INTERVAL_SECONDS` | `900` | How often to run freshness + row count checks |
+| `FRESHNESS_MAX_AGE_HOURS` | `6` | Max age of last successful run before freshness alert |
+| `ROW_COUNT_THRESHOLD_PCT` | `0.20` | Row count deviation % that triggers a proactive anomaly |
+| `WEBHOOK_PORT` | `8765` | Port the FastAPI webhook server listens on |
+| `SLACK_WEBHOOK_URL` | — | Slack Incoming Webhook URL for incident alerts |
 
 Tests override `PIPELINE_DB_PATH` with a temp path — each test run is fully isolated.
 
@@ -107,6 +125,39 @@ Every agent in `agents/` follows the same structure:
 | [agents/blast_radius.py](agents/blast_radius.py) | `DEPENDENCY_GRAPH`, `assess_blast_radius(task)`, `should_auto_remediate(confidence, blast)` |
 | [agents/metrics.py](agents/metrics.py) | `write_incident_outcome()`, `compute_self_healing_metrics(days=30)` |
 | [agents/patterns.py](agents/patterns.py) | `get_known_patterns(pipeline)`, `match_pattern()`, `upsert_pattern()` |
+
+### Autonomous watcher
+
+The `watcher/` package makes Sentinel fully autonomous — no button clicks required.
+
+| Module | Purpose |
+|---|---|
+| [watcher/sentinel_watcher.py](watcher/sentinel_watcher.py) | `SentinelWatcher` — main loop: polls Airflow for new failures + runs proactive checks on a schedule; fires `SentinelOrchestrator.run()` for each new issue |
+| [watcher/proactive_monitor.py](watcher/proactive_monitor.py) | `check_pipeline_freshness()` + `check_row_count_baselines()` — create synthetic `pipeline_runs` rows when anomalies are detected without an Airflow failure |
+| [watcher/webhook_server.py](watcher/webhook_server.py) | FastAPI server with `POST /webhook/failure` — called by Airflow `on_failure_callback`; triggers Sentinel immediately (zero polling delay) |
+| [watcher/alerting.py](watcher/alerting.py) | `send_slack_alert()` — posts formatted Slack attachment after every incident |
+
+**Trigger flow:**
+```
+Airflow failure  →  on_failure_callback  →  POST /webhook/failure  →  SentinelOrchestrator.run()  →  Slack alert
+         or
+Watcher poll (every 5 min)  →  poll_failed_runs()  →  sync_run_to_db()  →  SentinelOrchestrator.run()  →  Slack alert
+         or
+Proactive check (every 15 min)  →  freshness / row-count anomaly  →  synthetic run_id  →  SentinelOrchestrator.run()  →  Slack alert
+```
+
+`SentinelOrchestrator`, all agents, and the data layer are unchanged — the watcher is purely an additional trigger layer. `_is_already_processed()` prevents duplicate processing by checking whether an `incidents` row already exists for the `run_id`.
+
+**Configure Airflow DAG to call the webhook:**
+```python
+def sentinel_callback(context):
+    import requests
+    requests.post("http://sentinel-host:8765/webhook/failure",
+                  json={"dag_id": context["dag"].dag_id, "run_id": context["run_id"]},
+                  timeout=5)
+
+dag = DAG("your_dag", on_failure_callback=sentinel_callback, ...)
+```
 
 ### Tools
 
