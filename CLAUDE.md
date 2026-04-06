@@ -2,6 +2,42 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## System Identity
+
+**Pipeline Sentinel** is a self-healing data pipeline monitor. It detects failures in Airflow DAG runs and autonomously remediates them using a multi-agent LLM system built on the Anthropic API.
+
+**What it is allowed to do (auto-approved):**
+- Read pipeline state from SQLite
+- Retry failed tasks (probabilistic in simulator; Airflow REST API in live mode)
+- Apply deduplication, reload schema, extend ingestion window, run dbt full-refresh
+- Write incidents, audit logs, pattern memory, and outcome metrics to SQLite
+- Send Slack alerts
+
+**What requires human approval (escalation):**
+- Any action when `blast_radius != "LOW"` OR `confidence != "high"`
+- Auth failures (`auth_failure` type) — credential rotation cannot be automated
+- Any failure that hits `MAX_RETRY_ATTEMPTS` without resolution
+
+**Output contract:** Every `SentinelOrchestrator.run()` returns:
+```python
+{
+    "incident_id": int,
+    "run_id": str,
+    "resolution_status": "resolved" | "escalated" | "cancelled",
+    "retry_count": int,
+    "explanation": dict,      # from Explanation Agent
+    "blast_radius": str,      # "LOW" | "MEDIUM" | "HIGH"
+    "pattern_matched": bool,  # True if pattern memory fast-path was used
+}
+```
+
+**Key reference docs (read before modifying agents or orchestrator):**
+- [docs/error_taxonomy.md](docs/error_taxonomy.md) — canonical failure modes, strategies, confidence floors
+- [docs/state_schema.md](docs/state_schema.md) — state dict contract at each orchestrator phase
+- [docs/tool_approval_tiers.md](docs/tool_approval_tiers.md) — which tools are auto-approved vs require escalation
+- [docs/agents/](docs/agents/) — per-agent identity, tool budget, and output contract
+- [DECISIONS.md](DECISIONS.md) — architectural decision records
+
 ## Commands
 
 ```bash
