@@ -8,13 +8,18 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from simulator.database import init_db, get_connection
-from simulator.pipeline import PipelineSimulator
-from simulator.failure_injector import FailureInjector, FAILURE_MODES
-from simulator.airflow_connector import AirflowConnector
-from orchestrator.sentinel import SentinelOrchestrator
-from agents.metrics import compute_self_healing_metrics
-from agents.audit import get_incident_audit
+_IMPORT_ERROR: str | None = None
+try:
+    from simulator.database import init_db, get_connection
+    from simulator.pipeline import PipelineSimulator
+    from simulator.failure_injector import FailureInjector, FAILURE_MODES
+    from simulator.airflow_connector import AirflowConnector
+    from orchestrator.sentinel import SentinelOrchestrator
+    from agents.metrics import compute_self_healing_metrics
+    from agents.audit import get_incident_audit
+except Exception as _exc:
+    _IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
+    print(f"[Pipeline Sentinel] IMPORT ERROR — {_IMPORT_ERROR}", file=sys.stderr)
 
 _STOP_EVENT = threading.Event()
 
@@ -182,7 +187,23 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session state ─────────────────────────────────────────────────────────
-init_db()
+_INIT_ERROR: str | None = None
+if _IMPORT_ERROR is None:
+    try:
+        init_db()
+    except Exception as _exc:
+        _INIT_ERROR = f"{type(_exc).__name__}: {_exc}"
+        print(f"[Pipeline Sentinel] INIT ERROR — {_INIT_ERROR}", file=sys.stderr)
+
+if _IMPORT_ERROR or _INIT_ERROR:
+    _err_msg = _IMPORT_ERROR or _INIT_ERROR
+    st.error(
+        f"**Pipeline Sentinel failed to initialise.**\n\n"
+        f"```\n{_err_msg}\n```\n\n"
+        "Check the deployment logs for the full traceback.",
+        icon="🚨",
+    )
+    st.stop()
 
 _DEFAULTS = {
     "thought_stream":   [],
