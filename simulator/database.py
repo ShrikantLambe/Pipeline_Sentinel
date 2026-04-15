@@ -1,15 +1,16 @@
 import json
-import sqlite3
 import os
+import sqlite3
 from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
 DB_PATH = os.getenv("PIPELINE_DB_PATH", "data/sentinel.db")
 
-# Suppress Python 3.12 deprecation warnings for datetime ↔ SQLite conversion
-sqlite3.register_adapter(datetime, lambda d: d.isoformat())
-sqlite3.register_converter("TIMESTAMP", lambda b: datetime.fromisoformat(b.decode()))
+# SQLite datetime adapters — only registered when not using PostgreSQL
+if not os.getenv("DATABASE_URL"):
+    sqlite3.register_adapter(datetime, lambda d: d.isoformat())
+    sqlite3.register_converter("TIMESTAMP", lambda b: datetime.fromisoformat(b.decode()))
 
 # Baseline schemas for schema drift detection (24 columns each)
 _BASELINE_SCHEMAS = {
@@ -29,65 +30,136 @@ _BASELINE_SCHEMAS = {
 }
 
 
-def get_connection():
-    # Read env var dynamically so tests can override PIPELINE_DB_PATH per-fixture
-    # without needing to reload the module.
+# ── DB adapter layer ──────────────────────────────────────────────────────────
+# Normalises SQLite and psycopg2 differences so every other module can use
+# the same SQL (? placeholders, .lastrowid) regardless of the backend.
+
+class _CursorWrapper:
+    def __init__(self, cursor, is_postgres: bool):
+        self._cur = cursor
+        self._is_postgres = is_postgres
+
+    def execute(self, sql: str, params=()):
+        if self._is_postgres:
+            sql = sql.replace("?", "%s")
+        self._cur.execute(sql, params)
+        return self
+
+    def executemany(self, sql: str, params_seq):
+        if self._is_postgres:
+            sql = sql.replace("?", "%s")
+        self._cur.executemany(sql, params_seq)
+        return self
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    @property
+    def lastrowid(self):
+        # psycopg2 doesn't set lastrowid; use lastval() which returns the last
+        # sequence value generated in the current session.
+        if self._is_postgres:
+            self._cur.execute("SELECT lastval()")
+            return self._cur.fetchone()[0]
+        return self._cur.lastrowid
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+
+class _ConnectionWrapper:
+    def __init__(self, conn, is_postgres: bool):
+        self._conn = conn
+        self._is_postgres = is_postgres
+
+    def cursor(self) -> _CursorWrapper:
+        return _CursorWrapper(self._conn.cursor(), self._is_postgres)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+
+def get_connection() -> _ConnectionWrapper:
+    db_url = os.getenv("DATABASE_URL")
+    if db_url:
+        import psycopg2
+        conn = psycopg2.connect(db_url)
+        return _ConnectionWrapper(conn, is_postgres=True)
     db_path = os.getenv("PIPELINE_DB_PATH", DB_PATH)
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    return sqlite3.connect(
+    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+    conn = sqlite3.connect(
         db_path,
         detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
     )
+    return _ConnectionWrapper(conn, is_postgres=False)
+
+
+def _adapt_ddl(sql: str) -> str:
+    """Translate SQLite DDL to PostgreSQL when DATABASE_URL is set."""
+    if os.getenv("DATABASE_URL"):
+        sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+    return sql
 
 
 def init_db():
     conn = get_connection()
     c = conn.cursor()
+    is_postgres = bool(os.getenv("DATABASE_URL"))
 
     # Pipeline runs table
-    c.execute("""
+    c.execute(_adapt_ddl("""
         CREATE TABLE IF NOT EXISTS pipeline_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             dag_id TEXT NOT NULL,
             run_id TEXT NOT NULL UNIQUE,
-            status TEXT NOT NULL,           -- running, success, failed, remediated
+            status TEXT NOT NULL,
             started_at TIMESTAMP,
             completed_at TIMESTAMP,
             expected_row_count INTEGER,
             actual_row_count INTEGER,
-            failure_type TEXT,              -- null if no failure
+            failure_type TEXT,
             failure_detail TEXT,
             retry_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
+    """))
 
-    # Task states table (simulates Airflow task instances)
-    c.execute("""
+    # Task states table
+    c.execute(_adapt_ddl("""
         CREATE TABLE IF NOT EXISTS task_states (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
             task_id TEXT NOT NULL,
-            status TEXT NOT NULL,           -- queued, running, success, failed, skipped
+            status TEXT NOT NULL,
             duration_seconds REAL,
             error_message TEXT,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
+    """))
 
-    # Schema registry (for schema drift detection)
-    c.execute("""
+    # Schema registry
+    c.execute(_adapt_ddl("""
         CREATE TABLE IF NOT EXISTS schema_registry (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             table_name TEXT NOT NULL,
-            expected_columns TEXT NOT NULL,  -- JSON array
-            actual_columns TEXT,             -- JSON array (null = no snapshot yet)
+            expected_columns TEXT NOT NULL,
+            actual_columns TEXT,
             recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
+    """))
 
     # Incident log
-    c.execute("""
+    c.execute(_adapt_ddl("""
         CREATE TABLE IF NOT EXISTS incidents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
@@ -95,33 +167,36 @@ def init_db():
             failure_type TEXT NOT NULL,
             detected_at TIMESTAMP,
             resolved_at TIMESTAMP,
-            resolution_status TEXT,         -- resolved, escalated
+            resolution_status TEXT,
             retry_attempts INTEGER DEFAULT 0,
             root_cause TEXT,
-            remediation_steps TEXT,         -- JSON array of steps taken
-            reflection_notes TEXT,          -- agent's self-assessment
-            explanation TEXT,               -- plain English narrative
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            remediation_steps TEXT,
+            reflection_notes TEXT,
+            explanation TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            thought_log TEXT,
+            blast_radius TEXT,
+            patterns_consulted TEXT
         )
-    """)
+    """))
 
-    # Agent audit log — one row per agent transition per incident (Prompt 1)
-    c.execute("""
+    # Agent audit log
+    c.execute(_adapt_ddl("""
         CREATE TABLE IF NOT EXISTS agent_audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            incident_id INTEGER,            -- FK to incidents.id (populated after incident write)
+            incident_id INTEGER,
             run_id TEXT NOT NULL,
             agent_name TEXT NOT NULL,
-            input_summary TEXT,             -- JSON
+            input_summary TEXT,
             decision TEXT,
             confidence TEXT,
-            output_summary TEXT,            -- JSON
+            output_summary TEXT,
             recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
+    """))
 
-    # Incident outcomes — structured metrics per incident (Prompt 3)
-    c.execute("""
+    # Incident outcomes
+    c.execute(_adapt_ddl("""
         CREATE TABLE IF NOT EXISTS incident_outcomes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             incident_id INTEGER,
@@ -129,17 +204,17 @@ def init_db():
             dag_id TEXT,
             detected_at TIMESTAMP,
             resolved_at TIMESTAMP,
-            resolution_type TEXT,           -- AUTO_RESOLVED | ESCALATED | FAILED
+            resolution_type TEXT,
             root_cause_category TEXT,
-            agent_confidence_score REAL,    -- 0.0–1.0
+            agent_confidence_score REAL,
             mttr_seconds REAL,
-            blast_radius TEXT,              -- LOW | MEDIUM | HIGH
+            blast_radius TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
+    """))
 
-    # Incident pattern memory — rolling stats per (root_cause, pipeline, fix) (Prompt 5)
-    c.execute("""
+    # Incident pattern memory
+    c.execute(_adapt_ddl("""
         CREATE TABLE IF NOT EXISTS incident_patterns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             root_cause_category TEXT NOT NULL,
@@ -150,21 +225,27 @@ def init_db():
             last_seen_at TIMESTAMP,
             UNIQUE(root_cause_category, pipeline_name, fix_action_taken)
         )
-    """)
+    """))
 
     conn.commit()
 
     # ── Migrations for tables that may already exist ───────────────────────
-    for col_sql in [
-        "ALTER TABLE incidents ADD COLUMN thought_log TEXT",
-        "ALTER TABLE incidents ADD COLUMN blast_radius TEXT",
-        "ALTER TABLE incidents ADD COLUMN patterns_consulted TEXT",
-    ]:
-        try:
-            c.execute(col_sql)
+    # PostgreSQL supports IF NOT EXISTS; SQLite uses try/except.
+    migration_cols = [
+        ("incidents", "thought_log", "TEXT"),
+        ("incidents", "blast_radius", "TEXT"),
+        ("incidents", "patterns_consulted", "TEXT"),
+    ]
+    for table, col, col_type in migration_cols:
+        if is_postgres:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {col_type}")
             conn.commit()
-        except Exception:
-            pass  # Column already exists
+        else:
+            try:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                conn.commit()
+            except Exception:
+                pass  # column already exists
 
     # ── Seed baseline schema snapshots (idempotent) ────────────────────────
     for table_name, columns in _BASELINE_SCHEMAS.items():
@@ -180,4 +261,5 @@ def init_db():
     conn.commit()
 
     conn.close()
-    print(f"Database initialized at {DB_PATH}")
+    db_label = os.getenv("DATABASE_URL", DB_PATH)
+    print(f"Database initialized at {db_label}")

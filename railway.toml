@@ -1,0 +1,18 @@
+[build]
+builder = "nixpacks"
+
+# ── Streamlit UI (web service) ────────────────────────────────────────────────
+# Required env vars in Railway dashboard:
+#   DATABASE_URL   — set automatically by Railway PostgreSQL addon
+#   ANTHROPIC_API_KEY
+#   REFLECTION_MODEL   (e.g. claude-sonnet-4-5)
+#   USE_AIRFLOW        (false)
+[deploy]
+startCommand = "streamlit run app/streamlit_app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true"
+healthcheckPath = "/"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+
+# ── Webhook service — add as a second Railway service, same repo ──────────────
+# Start command:  uvicorn watcher.webhook_server:app --host 0.0.0.0 --port $PORT
+# Same env vars as above (DATABASE_URL links both services to the shared DB)
