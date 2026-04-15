@@ -1,0 +1,6 @@
+[client]
+showErrorDetails = true
+
+[server]
+headless = true
+enableXsrfProtection = false
