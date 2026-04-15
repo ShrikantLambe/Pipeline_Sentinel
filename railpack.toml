@@ -1,2 +1,5 @@
 [build]
 start = "streamlit run app/streamlit_app.py --server.port=8080 --server.address=0.0.0.0"
+
+[deploy]
+healthcheckPath = "/_stcore/health"
