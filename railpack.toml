@@ -1,5 +1,5 @@
 [build]
-start = "streamlit run app/streamlit_app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true"
+start = "sh start.sh"
 
 [deploy]
 healthcheckPath = "/_stcore/health"
